@@ -4,57 +4,70 @@ const mysql = require('mysql2/promise');
     const connection = await mysql.createConnection({
         host: 'localhost',
         user: 'root',
-        password: '12345678',
-        database: 'sfco_crm_perf'
+        password: 'root',
+        database: 'sfco_crm_perf',
+        port: 3307 
     });
 
     console.log("✅ Conectado a la base de datos MySQL!");
 
     try {
-        // 📌 Obtener todos los leads
-        const [rows] = await connection.execute("SELECT * FROM tblleads WHERE junk = 0");
+        // 📌 Obtener todos los duplicados con coincidencia parcial en la dirección
+        const [duplicates] = await connection.execute(`
+            SELECT t1.*
+            FROM tblleads t1
+            JOIN (
+                SELECT name, phonenumber
+                FROM tblleads
+                WHERE junk = 0
+                GROUP BY name, phonenumber
+                HAVING COUNT(*) > 1
+            ) t2
+            ON t1.name = t2.name AND t1.phonenumber = t2.phonenumber
+            WHERE t1.junk = 0
+            AND EXISTS (
+                SELECT 1 FROM tblleads t3
+                WHERE t3.name = t1.name
+                AND t3.phonenumber = t1.phonenumber
+                AND t3.address LIKE CONCAT('%', t1.address, '%')
+                AND t3.id <> t1.id
+            )
+            ORDER BY t1.name, t1.phonenumber, t1.address;
+        `);
 
-        const checkeds = [];
+        console.log(`🔍 Encontrados ${duplicates.length} registros duplicados.`);
 
-        for (const lead of rows) {
-            if (checkIfAlreadyChecked(checkeds, lead)) continue;
+        // 📌 Agrupar duplicados por `name` y `phonenumber`
+        const groupedLeads = {};
+        for (const lead of duplicates) {
+            const key = `${lead.name}_${lead.phonenumber}`;
+            if (!groupedLeads[key]) groupedLeads[ key] = [];
+            groupedLeads[key].push(lead);
+        }
 
-            // 📌 Buscar todos los leads duplicados
-            const [duplicates] = await connection.execute(
-                `SELECT * FROM tblleads WHERE name = ? AND address LIKE CONCAT('%', ?, '%') AND phonenumber = ?`,
-                [lead.name, lead.address, lead.phonenumber]
-            );
+        for (const key in groupedLeads) {
+            const leads = groupedLeads[key];
+ 
+            // 📌 Calcular puntajes y ordenar
+            const scoredLeads = leads.map(lead => {
+                let filledFieldsCount = Object.values(lead).filter(v => v !== null && v !== "" && v !== "none" && v !== 0).length;
+                let statusScore = lead.status !== 13 ? 5 : 0; // 📌 Si no es "new", +5 puntos
+                return { ...lead, score: filledFieldsCount + statusScore };
+            });
 
-            if (duplicates.length > 1) {
-                console.log(`🔍 Encontrados ${duplicates.length} duplicados para: ${lead.name}`);
+            scoredLeads.sort((a, b) => b.score - a.score);
 
-                // 📌 Calcular puntajes para ordenar
-                const scoredDuplicates = duplicates.map(duplicate => {
-                    let filledFieldsCount = Object.values(duplicate).filter(v => v !== null && v !== "" && v !== "none" && v !== 0).length;
-                    let statusScore = duplicate.status !== 13 ? 5 : 0; // 📌 Si no es "new", +5 puntos
-                    return { ...duplicate, score: filledFieldsCount + statusScore };
-                });
+            // 📌 Mantener el mejor registro
+            const bestLead = scoredLeads[0];
+            console.log(`✅ Manteniendo ID ${bestLead.id} como válido.`);
 
-                // 📌 Ordenamos los duplicados por mayor puntaje
-                const sortedDuplicates = scoredDuplicates.sort((a, b) => b.score - a.score);
-
-                const leadToKeep = sortedDuplicates[0]; // 📌 Nos quedamos con el mejor lead
-
-                checkeds.push(leadToKeep); // 📌 Aseguramos que este queda sin `junk = 1`
-
-                console.log(`✅ Manteniendo como válido: ID ${leadToKeep.id}`);
-
-                // 📌 Marcar los demás como `junk = 1`
-                for (let i = 1; i < sortedDuplicates.length; i++) {
-                    await connection.execute(
-                        `UPDATE tblleads SET junk = 1 WHERE id = ?`,
-                        [sortedDuplicates[i].id]
-                    );
-                    console.log(`⚠️ Marcado como junk: ID ${sortedDuplicates[i].id}`);
-                }
-            } else {
-                // 📌 Si no hay duplicados, lo agregamos como válido
-                checkeds.push(lead);
+            // 📌 Marcar los demás como `junk = 1`
+            for (let i = 1; i < scoredLeads.length; i++) {
+                await connection.execute(
+                    `UPDATE tblleads SET junk = 1 WHERE id = ?`,
+                    [scoredLeads[i].id]
+                );
+                console.log(`⚠️ Marcado como junk: ID ${scoredLeads[i].id}`);
             }
         }
 
@@ -63,14 +76,6 @@ const mysql = require('mysql2/promise');
         console.error("❌ Error:", error);
     } finally {
         await connection.end();
-        console.log("Conexión cerrada.");
+        console.log("🔌 Conexión cerrada.");
     }
 })();
-
-const checkIfAlreadyChecked = (array, object) => {
-    return array.some(item =>
-        item.name === object.name &&
-        item.address === object.address &&
-        item.phonenumber === object.phonenumber
-    );
-};
